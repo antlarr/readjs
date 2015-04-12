@@ -1,0 +1,144 @@
+#!/usr/bin/python
+#
+#  readjs waits for an event from the keyboard or js and writes it to stdout
+#  Copyright (C) 2015 Antonio Larrosa <larrosa at kde.org>
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+import sys, os, select, time
+import os.path
+import struct, tty, termios, fcntl
+import datetime
+
+JFORMAT='IhBB'
+#u32, s16, u8, u8
+JEVENT_SIZE=struct.calcsize(JFORMAT)
+# For /dev/input/inputX 
+#KFORMAT='IIHHI'
+#timeval, u16, u16, u32
+#KEVENT_SIZE=struct.calcsize(KFORMAT)
+
+import argparse
+
+defjs=[ '/dev/input/js' + str(n) for n in range(4) if os.path.exists('/dev/input/js'+str(n))  ]
+
+parser = argparse.ArgumentParser(description='Wait until user press a key in the keyboard, an event from the joystick is received or a timeout happens.',
+                                 epilog='Typical usage: readjs -j -t 5')
+parser.add_argument('-j', '--js-devices', dest='jsdevices', action='store', nargs='*', 
+                   help='Read from a joystick device(s). If no joystick device is specified, all available joysticks are read')
+parser.add_argument('-a', '--all-events', dest='ignorePreviousEvents', action='store_const', const=False, default=True,
+                   help='Return all events without trying to be smart since the default behaviour ignores button releases from presses prior to the command execution.')
+parser.add_argument('-t', '--timeout', type=float, default=3333333, # 105 years
+                   help='Number of seconds to wait before timing out with return code 2')
+
+args = parser.parse_args()
+if args.jsdevices==[]: args.jsdevices=defjs
+elif args.jsdevices==None: args.jsdevices=[]
+
+def flush_device(fd, bs=1):
+   r,w,e = select.select([fd],[],[], 0.01)
+   while fd in r:
+      os.read(fd, bs)
+      r,w,e = select.select([fd],[],[], 0.01)
+
+def printkey(key):
+         (tv_sec, tv_usec, type, code, value) = struct.unpack(KFORMAT, key)
+         print len(key)
+
+         for b in key:
+             sys.stdout.write('%02X ' %  ord(b))
+         print tv_sec, tv_usec, type, code, value
+
+
+class Joystick:
+   def __init__(self, device):
+      if not device.startswith('/dev/input/js'):
+         print 'Error: Joystick device must be /dev/input/jsN'
+         sys.exit(1)
+      self.device=device
+      self.id=os.path.basename(device)
+      self.fd=os.open(device, os.O_RDONLY)
+      self.initState=[]
+
+   def readEvent(self):
+      ''' returns (time, value, type, number) of the event '''
+      event = os.read(self.fd, JEVENT_SIZE)
+      return struct.unpack(JFORMAT, event)
+
+   def flushEvents(self):
+      r,w,e = select.select([self.fd],[],[], 0.01)
+      while self.fd in r:
+         buf = os.read( self.fd, JEVENT_SIZE )
+         (time, value, type, number) = struct.unpack(JFORMAT, buf)
+         if type>128 and value!=0:
+            self.initState.append( (type-128, number) )
+         r,w,e = select.select([self.fd],[],[], 0.01)
+
+   def strEvent(self, value, type, number):
+      if type == 1:
+         return 'JS %s Button %d %s' % ( self.id, number, 'Press' if value == 1 else 'Relese' )
+      elif type == 2:
+         return 'JS %s Stick %s%s' % ( self.id, '+' if value > 0 else '-' if value < 0 else ' ', 'XYxy'[number] )
+      return 'JS %s Unknown event (%s %s %s)' % ( self.id, value, type, number )
+
+stdinfd=sys.stdin.fileno()
+old_settings= termios.tcgetattr(stdinfd)
+output=''
+rc=None
+starttime=datetime.datetime.now()
+timeouttime=starttime+datetime.timedelta(seconds=args.timeout)
+
+try:
+   tty.setraw(stdinfd)
+
+   joysticks=[ Joystick(dev) for dev in args.jsdevices ]
+
+   flush_device(stdinfd, 1)
+   map( lambda js: js.flushEvents(), joysticks )
+
+   while rc == None:
+      now=datetime.datetime.now()
+      r,w,e = select.select([stdinfd] + [js.fd for js in joysticks],[],[], (timeouttime-now).total_seconds())
+      if r == []:
+         # Timeout
+         rc=2
+         break
+
+      if stdinfd in r:
+         # There's a key press from keyboard
+         ch=sys.stdin.read(1)
+         output=ch
+         rc=0
+         break
+
+      for js in joysticks:
+         if js.fd not in r: continue
+         # There's a joystick event from joystick js
+         (time, value, type, number) = js.readEvent()
+         if args.ignorePreviousEvents and (type, number) in js.initState and value==0:
+	    # We ignore button release events or events from the stick going
+	    # back to the 0 position if the button was pressed or the stick
+	    # was being moved when the app started
+            js.initState.remove( (type, number) )
+            continue
+         output = js.strEvent(value, type, number)
+         rc=0
+         break
+
+finally:
+   termios.tcsetattr(stdinfd, termios.TCSANOW, old_settings)
+       
+print output
+sys.exit(rc)
